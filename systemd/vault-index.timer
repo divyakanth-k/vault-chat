@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly vault re-index
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Catch up after the laptop was asleep or powered off at 03:00.
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

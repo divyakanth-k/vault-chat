@@ -1,0 +1,381 @@
+"""Shared plumbing for the vault tools: config, SQLite storage, model calls.
+
+Two backends are supported and auto-detected:
+
+  lmstudio  OpenAI-compatible server on :1234, plus the /api/v1/chat endpoint
+            that executes MCP tools server-side (LM Studio 0.4.0+).
+  ollama    The native /api/* endpoints on :11434.
+
+Everything here is stdlib plus numpy. The only network destinations are those
+two loopback addresses.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("numpy is required:  python3 -m pip install --user numpy")
+
+
+def config_dir() -> Path:
+    """Where settings live, following each platform's convention."""
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", "~")).expanduser() / "vault-tools"
+    return Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "vault-tools"
+
+
+CONFIG_PATH = config_dir() / "config.json"
+
+try:
+    _CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    _CONFIG = {}
+
+
+def setting(key: str, default: str) -> str:
+    """Environment wins, then the config file written by the installer,
+    then the built-in default."""
+    value = os.environ.get(key) or _CONFIG.get(key)
+    return str(value) if value else default
+
+
+OLLAMA_HOST = setting("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+LMSTUDIO_HOST = setting("LMSTUDIO_HOST", "http://127.0.0.1:1234").rstrip("/")
+LM_API_TOKEN = setting("LM_API_TOKEN", "")
+
+VAULT = Path(setting("VAULT_DIR", "~/vault")).expanduser()
+DB_PATH = Path(setting("VAULT_DB", str(VAULT / ".index" / "vault.db"))).expanduser()
+NUM_CTX = int(setting("VAULT_NUM_CTX", "8192"))
+# 0 means "let the runtime decide". install.py writes the physical core count
+# here, because hyper-threaded siblings share a memory path and using both
+# usually makes CPU inference slower, not faster.
+NUM_THREADS = int(setting("VAULT_THREADS", "0"))
+
+# "auto" probes LM Studio first, then Ollama.
+BACKEND = setting("VAULT_BACKEND", "auto").lower()
+
+DEFAULT_MODELS = {
+    "lmstudio": {
+        "embed": "text-embedding-nomic-embed-text-v1.5",
+        "chat": "qwen2.5-coder-7b-instruct",
+    },
+    "ollama": {
+        "embed": "nomic-embed-text",
+        "chat": "qwen2.5-coder:7b",
+    },
+}
+
+TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS files (
+    path       TEXT PRIMARY KEY,
+    sha        TEXT NOT NULL,
+    mtime      REAL NOT NULL,
+    indexed_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chunks (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    path    TEXT NOT NULL,
+    ord     INTEGER NOT NULL,
+    heading TEXT,
+    text    TEXT NOT NULL,
+    vec     BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chunks_by_path ON chunks(path);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    path          TEXT PRIMARY KEY,
+    last_review   REAL NOT NULL,
+    interval_days REAL NOT NULL
+);
+"""
+
+
+# --------------------------------------------------------------- backend
+
+
+_resolved: str | None = None
+
+
+def _probe(url: str) -> bool:
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True  # reachable, just unhappy with the request — good enough
+    except Exception:
+        return False
+
+
+def backend() -> str:
+    """Which runtime we are talking to. Probed once, then cached."""
+    global _resolved
+    if _resolved:
+        return _resolved
+    if BACKEND in ("lmstudio", "ollama"):
+        _resolved = BACKEND
+    elif _probe(f"{LMSTUDIO_HOST}/v1/models"):
+        _resolved = "lmstudio"
+    elif _probe(f"{OLLAMA_HOST}/api/tags"):
+        _resolved = "ollama"
+    else:
+        sys.exit(
+            f"No model runtime found.\n"
+            f"  LM Studio expected at {LMSTUDIO_HOST}  (lms server start)\n"
+            f"  Ollama expected at    {OLLAMA_HOST}  (ollama serve)\n"
+            f"Set VAULT_BACKEND to force one."
+        )
+    return _resolved
+
+
+def host() -> str:
+    return LMSTUDIO_HOST if backend() == "lmstudio" else OLLAMA_HOST
+
+
+def default_model(role: str) -> str:
+    return DEFAULT_MODELS[backend()][role]
+
+
+def embed_model() -> str:
+    return setting("VAULT_EMBED_MODEL", default_model("embed"))
+
+
+def chat_model() -> str:
+    return setting("VAULT_CHAT_MODEL", default_model("chat"))
+
+
+# ------------------------------------------------------------------ http
+
+
+def _request(path: str, payload: dict | None = None, stream: bool = False, method: str = "POST"):
+    headers = {"Content-Type": "application/json"}
+    if LM_API_TOKEN and backend() == "lmstudio":
+        headers["Authorization"] = f"Bearer {LM_API_TOKEN}"
+    req = urllib.request.Request(
+        f"{host()}{path}",
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers=headers,
+        method=method,
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=900)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")[:600]
+        raise SystemExit(f"{host()}{path} returned {exc.code}:\n{body}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"Cannot reach {host()} ({exc.reason}).") from exc
+    return resp if stream else json.loads(resp.read())
+
+
+# -------------------------------------------------------------- embedding
+
+
+def embed(texts: list[str]) -> np.ndarray:
+    """Embed a batch and return L2-normalised rows, so cosine similarity
+    reduces to a plain dot product later."""
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    if backend() == "lmstudio":
+        data = _request("/v1/embeddings", {"model": embed_model(), "input": texts})
+        vectors = [row["embedding"] for row in data["data"]]
+    else:
+        try:
+            vectors = _request("/api/embed", {"model": embed_model(), "input": texts})["embeddings"]
+        except (SystemExit, KeyError):
+            # Older Ollama builds only expose the single-input endpoint.
+            vectors = [
+                _request("/api/embeddings", {"model": embed_model(), "prompt": t})["embedding"]
+                for t in texts
+            ]
+
+    matrix = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.clip(norms, 1e-9, None)
+
+
+# ------------------------------------------------------------------ chat
+
+
+def chat_stream(messages: list[dict], model: str | None = None, temperature: float = 0.2):
+    """Yield response text as it is generated, so words appear instead of
+    you staring at nothing for a minute."""
+    model = model or chat_model()
+
+    if backend() == "lmstudio":
+        resp = _request(
+            "/v1/chat/completions",
+            {"model": model, "messages": messages, "stream": True,
+             "temperature": temperature, "ttl": 3600},
+            stream=True,
+        )
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            body = line[5:].strip()
+            if body == "[DONE]":
+                break
+            try:
+                event = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            for choice in event.get("choices", []):
+                piece = choice.get("delta", {}).get("content")
+                if piece:
+                    yield piece
+        return
+
+    options = {"num_ctx": NUM_CTX, "temperature": temperature}
+    if NUM_THREADS:
+        options["num_thread"] = NUM_THREADS
+    resp = _request(
+        "/api/chat",
+        {"model": model, "messages": messages, "stream": True, "options": options},
+        stream=True,
+    )
+    for raw in resp:
+        line = raw.strip()
+        if not line:
+            continue
+        event = json.loads(line)
+        piece = event.get("message", {}).get("content", "")
+        if piece:
+            yield piece
+        if event.get("done"):
+            break
+
+
+def chat(messages: list[dict], model: str | None = None, temperature: float = 0.2) -> str:
+    return "".join(chat_stream(messages, model=model, temperature=temperature))
+
+
+def agent_chat(
+    user_input: str,
+    integrations: list | None = None,
+    model: str | None = None,
+    system: str | None = None,
+    context_length: int = NUM_CTX,
+    temperature: float = 0.2,
+) -> dict:
+    """LM Studio's /api/v1/chat — it runs the whole tool-calling loop itself,
+    including executing MCP servers, and returns the transcript.
+
+    Note the security shape: tools execute server-side, so there is no
+    per-call approval prompt. The `allowed_tools` allowlist on each
+    integration is what keeps a run inside its lane.
+    """
+    if backend() != "lmstudio":
+        raise SystemExit("MCP tool use requires the LM Studio backend (VAULT_BACKEND=lmstudio).")
+
+    payload: dict = {
+        "model": model or chat_model(),
+        "input": (
+            [{"role": "system", "content": system}, {"role": "user", "content": user_input}]
+            if system
+            else user_input
+        ),
+        "context_length": context_length,
+        "temperature": temperature,
+        "ttl": 3600,
+    }
+    if integrations:
+        payload["integrations"] = integrations
+    return _request("/api/v1/chat", payload)
+
+
+# --------------------------------------------------------------- storage
+
+
+def connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def pack(vec: np.ndarray) -> bytes:
+    return np.asarray(vec, dtype=np.float32).tobytes()
+
+
+def unpack(blob: bytes) -> np.ndarray:
+    return np.frombuffer(blob, dtype=np.float32)
+
+
+def load_matrix(conn: sqlite3.Connection) -> tuple[np.ndarray, list[sqlite3.Row]]:
+    """Pull every chunk into one matrix. Brute force is the right call here:
+    a personal vault is thousands of chunks, not millions, and an exact scan
+    of a few megabytes beats maintaining an approximate index."""
+    rows = conn.execute(
+        "SELECT id, path, ord, heading, text, vec FROM chunks ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float32), []
+    return np.vstack([unpack(r["vec"]) for r in rows]), rows
+
+
+# ----------------------------------------------------------------- misc
+
+
+def walk_vault(root: Path | None = None):
+    """Every text file in the vault, skipping dot-directories (which is how
+    the index itself stays out of its own corpus)."""
+    root = root or VAULT
+    for path in sorted(root.rglob("*")):
+        if path.suffix.lower() not in TEXT_SUFFIXES or not path.is_file():
+            continue
+        if any(part.startswith(".") for part in path.relative_to(root).parts):
+            continue
+        yield path
+
+
+def relative(path: Path) -> str:
+    """Vault-relative path, always with forward slashes.
+
+    as_posix() matters on Windows: str() would give 'notes\\retries.md', so
+    the same note would be stored under a different key than on Linux or
+    macOS, and lookups written with '/' would silently miss.
+    """
+    try:
+        return Path(path).resolve().relative_to(VAULT.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def ago(timestamp: float) -> str:
+    days = (time.time() - timestamp) / 86400
+    if days < 1:
+        return "today"
+    if days < 2:
+        return "yesterday"
+    if days < 60:
+        return f"{int(days)} days ago"
+    return f"{int(days / 30)} months ago"

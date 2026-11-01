@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "/Users/divyakanthreddykoppolu/code/vault-tools/.venv/bin/python" "/Users/divyakanthreddykoppolu/code/vault-tools/agent.py" "$@"

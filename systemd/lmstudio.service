@@ -1,0 +1,33 @@
+[Unit]
+Description=LM Studio headless daemon (llmster) with a model preloaded
+After=network.target
+
+# Install the daemon first:
+#   curl -fsSL https://lmstudio.ai/install.sh | bash
+# Then:
+#   systemctl --user enable --now lmstudio.service
+#   systemctl --user enable lingering   # or: loginctl enable-linger $USER
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+ExecStartPre=%h/.lmstudio/bin/lms daemon up
+# Models loaded with `lms load` have no idle TTL, so this one stays resident
+# and the agent never pays a cold reload. That is the whole point of running
+# it as a service. Swap the model id for whatever you settled on.
+ExecStartPre=%h/.lmstudio/bin/lms load qwen2.5-coder-7b-instruct --yes
+ExecStart=%h/.lmstudio/bin/lms server start
+ExecStop=%h/.lmstudio/bin/lms daemon down
+
+Restart=on-failure
+RestartSec=10
+
+# Uncomment to make "offline" enforceable rather than assumed. Leave it off
+# if any of your MCP servers are remote, or if you rely on JIT model
+# downloads — both need outbound access.
+# IPAddressAllow=localhost
+# IPAddressDeny=any
+
+[Install]
+WantedBy=default.target

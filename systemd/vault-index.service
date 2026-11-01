@@ -1,0 +1,24 @@
+[Unit]
+Description=Re-index the notes vault into the local vector store
+After=network.target lmstudio.service
+
+[Service]
+Type=oneshot
+Environment=VAULT_DIR=%h/vault
+# Leave VAULT_BACKEND unset to auto-detect LM Studio then Ollama. Pin it if
+# you run both, since embeddings from two models are not interchangeable and
+# a silent switch would force a full rebuild.
+# Environment=VAULT_BACKEND=lmstudio
+ExecStart=%h/vault-tools/index.py --quiet
+
+# This job only ever talks to the local runtime, so deny it everything else.
+IPAddressAllow=localhost
+IPAddressDeny=any
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/vault/.index
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
