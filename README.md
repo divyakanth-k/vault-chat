@@ -1,4 +1,4 @@
-# vault-tools
+# vault-chat
 
 A private AI setup that runs entirely on your own machine: offline coding help,
 a knowledge system built on your own notes, a chat screen, and an agent you can
@@ -254,8 +254,8 @@ built-in default**.
 
 The config file lives at:
 
-- Linux / macOS: `~/.config/vault-tools/config.json`
-- Windows: `%APPDATA%\vault-tools\config.json`
+- Linux / macOS: `~/.config/vault-chat/config.json`
+- Windows: `%APPDATA%\vault-chat\config.json`
 
 ```json
 {
@@ -389,8 +389,8 @@ installer, which puts it in a private virtual environment.
 ## Uninstall
 
 ```bash
-rm -rf ~/.config/vault-tools          # config  (%APPDATA%\vault-tools on Windows)
-rm -rf /path/to/vault-tools           # the tools, venv and launchers
+rm -rf ~/.config/vault-chat          # config  (%APPDATA%\vault-chat on Windows)
+rm -rf /path/to/vault-chat           # the tools, venv and launchers
 # your notes in ~/vault are untouched — delete them yourself if you want
 systemctl --user disable --now vault-index.timer lmstudio.service   # Linux
 ```
