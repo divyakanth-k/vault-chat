@@ -11,10 +11,18 @@ is no hand-rolled agent loop to go wrong.
     ./agent.py -p code --file src/handler.py "why does this retry twice?"
     ./agent.py -p tools "what is open on the billing board?"
     ./agent.py --list
-    ./agent.py                       # interactive
+    ./agent.py                       # interactive, remembers earlier turns
+
+Conversations are saved automatically and can be picked up again:
+
+    ./agent.py --sessions            # list saved conversations
+    ./agent.py -c                    # continue the most recent one (interactive)
+    ./agent.py -c "and for writes?"  # continue it with a one-shot follow-up
+    ./agent.py --resume 7            # continue conversation 7
+    ./agent.py --no-history ...      # neither read nor write saved history
 
 Profiles live in DEFAULT_PROFILES below and can be overridden or extended in
-~/.config/vault-agent/profiles.json (same shape, merged over the defaults).
+~/.config/vault-chat/profiles.json (same shape, merged over the defaults).
 """
 
 from __future__ import annotations
@@ -163,6 +171,67 @@ def save_to_daily(question: str, answer: str) -> None:
     print(f"  saved to {v.relative(note)}", file=sys.stderr)
 
 
+# -------------------------------------------------------------- history
+
+HISTORY_CHARS = 4000  # roughly 1,000 tokens of earlier turns
+
+
+def trim_history(messages: list[dict], budget: int) -> list[dict]:
+    """Keep the most recent turns that fit the budget. A small model has a
+    small window and pays for every token on every turn, so old turns are
+    dropped whole rather than truncated mid-sentence."""
+    kept: list[dict] = []
+    spent = 0
+    for m in reversed(messages):
+        spent += len(m["content"])
+        if spent > budget and kept:
+            break
+        kept.append(m)
+    kept.reverse()
+    while kept and kept[0]["role"] != "user":  # never open on an orphaned reply
+        kept.pop(0)
+    return kept
+
+
+class Conversation:
+    """The turns so far, optionally mirrored into the database.
+
+    Held in memory even when saving is off, so an interactive session still
+    has context; --no-history only stops it touching the database."""
+
+    def __init__(self, conn, profile_name: str, save: bool, resume: int | None = None):
+        self.conn = conn
+        self.profile_name = profile_name
+        self.save = save
+        self.id = resume
+        self.messages: list[dict] = v.session_messages(conn, resume) if resume else []
+
+    def history(self, budget: int) -> list[dict]:
+        return trim_history(self.messages, budget)
+
+    def remember(self, question: str, answer: str) -> None:
+        self.messages += [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+        if not self.save:
+            return
+        if self.id is None:
+            self.id = v.create_session(self.conn, self.profile_name, question)
+        v.add_messages(self.conn, self.id, [("user", question), ("assistant", answer)])
+
+
+def print_sessions(conn) -> None:
+    rows = v.list_sessions(conn, 30)
+    if not rows:
+        print("No saved conversations yet.")
+        return
+    print("Saved conversations (resume with --resume ID, or -c for the latest):\n")
+    for r in rows:
+        print(f"  {r['id']:>4}  {v.ago(r['updated_at']):<13} {r['profile']:<7} "
+              f"{r['n'] // 2:>3} turns  {r['title']}")
+
+
 # ------------------------------------------------------------------ run
 
 
@@ -191,7 +260,7 @@ def build_prompt(question: str, profile: dict, args, conn) -> str:
     return "\n\n".join(parts)
 
 
-def run(question: str, profile: dict, args, conn) -> None:
+def run(question: str, profile: dict, args, conn, convo: Conversation | None = None) -> str:
     prompt = build_prompt(question, profile, args, conn)
     integrations = profile.get("integrations") or []
     temperature = profile.get("temperature", 0.2)
@@ -200,8 +269,10 @@ def run(question: str, profile: dict, args, conn) -> None:
     # No tools means no reason to use the agent endpoint — plain streaming
     # chat shows words as they arrive, which matters a lot at 8 tokens/sec.
     if not integrations:
+        earlier = convo.history(args.history_chars) if convo else []
         messages = [
             {"role": "system", "content": profile.get("system", "")},
+            *earlier,
             {"role": "user", "content": prompt},
         ]
         answer_parts = []
@@ -222,13 +293,14 @@ def run(question: str, profile: dict, args, conn) -> None:
         )
         if args.json:
             print(json.dumps(data, indent=2))
-            return
+            return ""
         answer = render(data, args.show_reasoning)
         print(answer)
         show_stats(data)
 
     if args.save and answer.strip():
         save_to_daily(question, answer)
+    return answer
 
 
 def main() -> int:
@@ -236,7 +308,8 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("question", nargs="*")
-    parser.add_argument("-p", "--profile", default="ask", help="which profile to use (default: ask)")
+    parser.add_argument("-p", "--profile", default=None,
+                        help="which profile to use (default: ask, or the resumed conversation's)")
     parser.add_argument("--list", action="store_true", help="show available profiles and exit")
     parser.add_argument("--file", action="append", help="attach a file (repeatable)")
     parser.add_argument("--model", default=None, help="override the model for this run")
@@ -250,6 +323,15 @@ def main() -> int:
     parser.add_argument("--max-context-chars", type=int, default=6000, help="prompt budget for notes")
     parser.add_argument("--max-file-chars", type=int, default=12000, help="per-file truncation")
     parser.add_argument("--context-length", type=int, default=v.NUM_CTX)
+    parser.add_argument("--sessions", action="store_true", help="list saved conversations and exit")
+    parser.add_argument("-c", "--continue", dest="cont", action="store_true",
+                        help="continue the most recent saved conversation")
+    parser.add_argument("--resume", type=int, default=None, metavar="ID",
+                        help="continue a specific saved conversation")
+    parser.add_argument("--no-history", action="store_true",
+                        help="do not save this conversation or load saved ones")
+    parser.add_argument("--history-chars", type=int, default=HISTORY_CHARS,
+                        help="how much earlier conversation to send (default 4000)")
     args = parser.parse_args()
 
     profiles = load_profiles()
@@ -267,18 +349,43 @@ def main() -> int:
             print(f"  {name:<8} {body.get('description', '')}{suffix}")
         return 0
 
-    if args.profile not in profiles:
-        sys.exit(f"Unknown profile '{args.profile}'. Try --list.")
-    profile = profiles[args.profile]
-    check_allowlists(profile, args.allow_any)
-
     conn = v.connect()
 
-    if args.question:
-        run(" ".join(args.question), profile, args, conn)
+    if args.sessions:
+        print_sessions(conn)
         return 0
 
-    print(f"profile '{args.profile}' · {v.backend()} · Ctrl-D to quit\n")
+    resume = None
+    if not args.no_history:
+        resume = args.resume
+        if resume is None and args.cont:
+            resume = v.latest_session_id(conn)
+        if resume is not None and v.get_session(conn, resume) is None:
+            sys.exit(f"No saved conversation {resume}. Try --sessions.")
+
+    stored = v.get_session(conn, resume) if resume is not None else None
+    name = args.profile or (stored["profile"] if stored else "ask")
+    if name not in profiles:
+        sys.exit(f"Unknown profile '{name}'. Try --list.")
+    profile = profiles[name]
+    check_allowlists(profile, args.allow_any)
+
+    convo = Conversation(conn, name, save=not args.no_history, resume=resume)
+    if stored:
+        print(f"  resuming #{stored['id']}: {stored['title']} "
+              f"({len(convo.messages) // 2} earlier turns)", file=sys.stderr)
+        if profile.get("integrations"):
+            print("  note: tool profiles answer each question on its own; "
+                  "earlier turns are not sent.", file=sys.stderr)
+
+    if args.question:
+        question = " ".join(args.question)
+        answer = run(question, profile, args, conn, convo)
+        if answer.strip():
+            convo.remember(question, answer)
+        return 0
+
+    print(f"profile '{name}' · {v.backend()} · Ctrl-D to quit\n")
     while True:
         try:
             question = input("» ").strip()
@@ -286,7 +393,9 @@ def main() -> int:
             print()
             return 0
         if question:
-            run(question, profile, args, conn)
+            answer = run(question, profile, args, conn, convo)
+            if answer.strip():
+                convo.remember(question, answer)
             print()
 
 

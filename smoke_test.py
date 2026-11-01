@@ -344,6 +344,91 @@ try:
 except urllib.error.HTTPError as exc:
     check("unknown path 404s", exc.code == 404, str(exc.code))
 
+# --- saved conversations over HTTP
+def post(path, body, ctype="application/json"):
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": ctype}, method="POST")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.status, json.loads(r.read())
+
+
+def saved_ids():
+    return [x["id"] for x in json.loads(get("/api/sessions")[1])]
+
+
+before = set(saved_ids())
+events = sse({"profile": "ask", "save": True, "session": None,
+              "messages": [{"role": "user", "content": "how many retries"}]})
+announced = [e["id"] for e in events if e["type"] == "session"]
+check("saving a chat announces its session id", len(announced) == 1, str([e["type"] for e in events]))
+sid = announced[0] if announced else -1
+check("saved chat appears in the history list", sid in saved_ids())
+saved = json.loads(get(f"/api/session?id={sid}")[1])
+check("stored turn is question then answer",
+      [m["role"] for m in saved["messages"]] == ["user", "assistant"], str(saved["messages"]))
+check("stored question is the plain question, not the notes prompt",
+      saved["messages"][0]["content"] == "how many retries")
+check("stored answer matches what streamed", saved["messages"][1]["content"] == "Three attempts.")
+check("session title comes from the first question", saved["title"] == "how many retries")
+
+seen = {}
+
+
+def capture(msgs, **kw):
+    seen["msgs"] = msgs
+    return iter(["Same budget."])
+
+
+previous_stream = chat.v.chat_stream
+chat.v.chat_stream = capture
+events = sse({"profile": "ask", "save": True, "session": sid, "messages":
+              saved["messages"] + [{"role": "user", "content": "and for writes?"}]})
+chat.v.chat_stream = previous_stream
+check("follow-up stays in the same session",
+      [e["id"] for e in events if e["type"] == "session"] == [sid])
+check("model is sent the earlier turns",
+      [m["role"] for m in seen.get("msgs", [])] == ["system", "user", "assistant", "user"],
+      str([m["role"] for m in seen.get("msgs", [])]))
+check("both turns are stored",
+      len(json.loads(get(f"/api/session?id={sid}")[1])["messages"]) == 4)
+
+events = sse({"profile": "ask", "save": True, "session": 987654,
+              "messages": [{"role": "user", "content": "a fresh start"}]})
+new_id = [e["id"] for e in events if e["type"] == "session"]
+check("an unknown session id starts a new conversation",
+      len(new_id) == 1 and new_id[0] != 987654)
+
+count_before = len(saved_ids())
+chat.v.chat_stream = lambda *a, **k: iter([])
+events = sse({"profile": "ask", "save": True, "session": None,
+              "messages": [{"role": "user", "content": "this gets no answer"}]})
+chat.v.chat_stream = previous_stream
+check("a conversation that produced nothing is not left behind",
+      len(saved_ids()) == count_before)
+
+events = sse({"profile": "ask", "messages": [{"role": "user", "content": "unsaved"}]})
+check("requests without save stay stateless",
+      "session" not in [e["type"] for e in events] and len(saved_ids()) == count_before)
+
+try:
+    post("/api/session/delete", {"id": sid}, ctype="text/plain")
+    check("delete refuses a non-JSON content type", False, "no error raised")
+except urllib.error.HTTPError as exc:
+    check("delete refuses a non-JSON content type", exc.code == 415, str(exc.code))
+check("refused delete changed nothing", sid in saved_ids())
+
+status, body = post("/api/session/delete", {"id": sid})
+check("delete removes the conversation", status == 200 and sid not in saved_ids())
+try:
+    get(f"/api/session?id={sid}")
+    check("deleted session 404s", False, "no error raised")
+except urllib.error.HTTPError as exc:
+    check("deleted session 404s", exc.code == 404, str(exc.code))
+conn = v.connect()
+check("deleting a session removes its messages",
+      conn.execute("SELECT COUNT(*) n FROM messages WHERE session_id=?", (sid,)).fetchone()["n"] == 0)
+conn.close()
+
 httpd.shutdown()
 httpd.server_close()
 
@@ -360,6 +445,32 @@ check("config dir matches the one vaultdb reads",
       install.config_dir() == v.config_dir(), f"{install.config_dir()} vs {v.config_dir()}")
 check("runtime help covers all three platforms",
       {"Linux", "Darwin", "Windows"} == set(install.RUNTIME_HELP))
+# The project was renamed from vault-tools; settings under the old name must
+# keep working, and the installer must carry them across intact.
+import tempfile
+saved_env = {k: os.environ.get(k) for k in ("APPDATA", "XDG_CONFIG_HOME")}
+with tempfile.TemporaryDirectory() as tmp:
+    os.environ["APPDATA"] = os.environ["XDG_CONFIG_HOME"] = tmp
+    check("fresh install uses the vault-chat folder",
+          install.config_dir().name == "vault-chat" and v.config_dir() == install.config_dir())
+    legacy = Path(tmp) / "vault-tools"
+    legacy.mkdir()
+    (legacy / "config.json").write_text('{"VAULT_DIR": "/kept"}')
+    check("old settings folder is still honoured before migration",
+          install.config_dir() == legacy and v.config_dir() == legacy)
+    install.migrate_legacy_config()
+    check("migration moves the folder to vault-chat",
+          not legacy.exists() and install.config_dir().name == "vault-chat")
+    check("migration keeps the settings intact",
+          '"/kept"' in (install.config_dir() / "config.json").read_text())
+    install.migrate_legacy_config()
+    check("migrating twice is harmless", install.config_dir().name == "vault-chat")
+for key, value in saved_env.items():
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+
 check("scheduler names cover all three platforms",
       all(install._scheduler_name(p) != "the system scheduler"
           for p in ("Linux", "Darwin", "Windows")))
@@ -465,6 +576,103 @@ check("probe resolution finds binaries that exist",
       (hw._run(["ls", "/"]) is not None) if sys.platform != "win32" else True)
 check("report renders without raising", hw.print_report(probe_info) is None)
 check("hardware has a launcher", "vault-hardware" in install.COMMANDS)
+
+# --- 15. conversation history ---------------------------------------------
+print("\n[15] conversation history")
+import contextlib
+import io
+
+conn = v.connect()
+first = v.create_session(conn, "ask", "  a   long\nquestion  ")
+check("title collapses whitespace", v.get_session(conn, first)["title"] == "a long question")
+check("long titles are shortened", len(v.session_title("x" * 200)) <= 61)
+v.add_messages(conn, first, [("user", "q1"), ("assistant", "a1")])
+v.add_messages(conn, first, [("user", "q2"), ("assistant", "a2")])
+check("messages come back in order",
+      [m["content"] for m in v.session_messages(conn, first)] == ["q1", "a1", "q2", "a2"])
+check("latest session is the one touched last", v.latest_session_id(conn) == first)
+
+# The index can be rebuilt freely; the conversations must survive it.
+conn.close()
+sys.argv = ["index.py", "--rebuild", "--quiet"]
+index.main()
+conn = v.connect()
+check("index --rebuild leaves conversations alone",
+      len(v.session_messages(conn, first)) == 4)
+
+turns = [{"role": r, "content": "x" * 100} for r in ("user", "assistant") * 5]
+trimmed = agent.trim_history(turns, 250)
+check("trim keeps the newest whole turn", len(trimmed) == 2 and trimmed[-1] is turns[-1])
+check("trimmed history opens on a user message",
+      all(agent.trim_history(turns, b)[:1] in ([], [turns[0]], [turns[2]], [turns[4]],
+                                               [turns[6]], [turns[8]]) for b in (90, 150, 250, 450)))
+check("a roomy budget keeps everything", len(agent.trim_history(turns, 10_000)) == 10)
+check("nothing in, nothing out", agent.trim_history([], 100) == [])
+
+convo = agent.Conversation(conn, "code", save=True)
+convo.remember("why twice?", "Because of the retry wrapper.")
+check("first turn creates a saved conversation", convo.id is not None)
+resumed = agent.Conversation(conn, "code", save=True, resume=convo.id)
+check("resuming loads the earlier turns", len(resumed.messages) == 2)
+volatile = agent.Conversation(conn, "code", save=False)
+volatile.remember("q", "a")
+check("--no-history keeps turns in memory but not in the database",
+      volatile.id is None and len(volatile.messages) == 2
+      and v.latest_session_id(conn) == convo.id)
+
+run_args = argparse.Namespace(file=None, no_vault=True, k=6, min_score=0.0,
+                              max_context_chars=6000, max_file_chars=12000, model=None,
+                              save=False, json=False, history_chars=4000,
+                              context_length=8192, show_reasoning=False)
+seen = {}
+
+
+def capture(msgs, **kw):
+    seen["msgs"] = msgs
+    return iter(["ok"])
+
+
+previous_stream = v.chat_stream
+v.chat_stream = capture
+with contextlib.redirect_stdout(io.StringIO()):
+    agent.run("and now?", profiles["code"], run_args, conn, resumed)
+v.chat_stream = previous_stream
+check("agent sends earlier turns to the model",
+      [m["role"] for m in seen["msgs"]] == ["system", "user", "assistant", "user"],
+      str([m["role"] for m in seen.get("msgs", [])]))
+run_args.history_chars = 0
+v.chat_stream = capture
+with contextlib.redirect_stdout(io.StringIO()):
+    agent.run("and now?", profiles["code"], run_args, conn, resumed)
+v.chat_stream = previous_stream
+check("a zero history budget sends no earlier turns",
+      [m["role"] for m in seen["msgs"]] == ["system", "user"])
+
+# End to end through main(): continue the latest conversation with a follow-up.
+v.chat_stream = lambda *a, **k: iter(["A follow-up answer."])
+sys.argv = ["agent.py", "-c", "--no-vault", "what about timeouts?"]
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    agent.main()
+v.chat_stream = previous_stream
+check("-c appends to the latest conversation",
+      len(v.session_messages(conn, convo.id)) == 4, str(len(v.session_messages(conn, convo.id))))
+check("the follow-up was stored as asked",
+      v.session_messages(conn, convo.id)[2]["content"] == "what about timeouts?")
+
+sys.argv = ["agent.py", "--sessions"]
+listing = io.StringIO()
+with contextlib.redirect_stdout(listing):
+    agent.main()
+check("--sessions lists saved conversations", "turns" in listing.getvalue(), listing.getvalue()[:80])
+
+sys.argv = ["agent.py", "--resume", "424242", "hello"]
+check("resuming a missing conversation is a clear error",
+      "No saved conversation" in (raises(agent.main) or ""))
+
+v.delete_session(conn, first)
+check("deleting a conversation removes it and its messages",
+      v.get_session(conn, first) is None and v.session_messages(conn, first) == [])
+conn.close()
 
 shutil.rmtree(VAULT, ignore_errors=True)
 print()

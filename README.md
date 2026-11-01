@@ -216,6 +216,37 @@ can reach the address can use your model and read answers drawn from your privat
 notes. If you need it from another device, tunnel to it (Tailscale's free tier,
 or SSH port forwarding) rather than passing `--host 0.0.0.0`.
 
+### Conversation history — `agent.py` and `chat.py`
+
+Conversations are saved automatically and remembered within a session.
+
+```bash
+./agent.py --sessions              # list saved conversations
+./agent.py -c                      # continue the most recent one
+./agent.py -c "and for writes?"    # continue it with a one-shot follow-up
+./agent.py --resume 7              # continue a specific one
+./agent.py --no-history "..."      # neither read nor write saved history
+```
+
+In `chat.py` the sidebar lists past conversations; click one to reopen it, `×`
+to delete it, and "New conversation" to start fresh. Interactive `agent.py`
+also carries earlier turns forward now, so follow-up questions work.
+
+Things worth knowing:
+
+- Only your question and the answer are stored, **not** the note passages that
+  were pasted into the prompt. History stays small, and an old answer is never
+  replayed alongside note text that has since changed.
+- Only the most recent ~4,000 characters of earlier turns are sent to the model
+  (`--history-chars` in the CLI). A small model pays for every token on every
+  turn, so old turns are dropped whole rather than carried forever.
+- Note retrieval looks only at your newest message. A follow-up like "why?"
+  retrieves poorly; restate the topic ("why three retries?") for better matches.
+- Tool profiles (MCP) still answer each question on their own.
+- History lives in the same SQLite file as the index (`<vault>/.index/vault.db`)
+  but in separate tables, so `index.py --rebuild` does not erase it. If you
+  delete `.index/`, you delete your history too. Keep that folder out of git.
+
 ### `quiz.py` — remember what you wrote
 
 ```bash
@@ -256,6 +287,9 @@ The config file lives at:
 
 - Linux / macOS: `~/.config/vault-chat/config.json`
 - Windows: `%APPDATA%\vault-chat\config.json`
+
+(Earlier versions used a `vault-tools` folder. Running `install.py` moves it to
+`vault-chat` automatically, and until then the old folder keeps working.)
 
 ```json
 {
@@ -389,8 +423,8 @@ installer, which puts it in a private virtual environment.
 ## Uninstall
 
 ```bash
-rm -rf ~/.config/vault-chat          # config  (%APPDATA%\vault-chat on Windows)
-rm -rf /path/to/vault-chat           # the tools, venv and launchers
+rm -rf ~/.config/vault-chat           # config  (%APPDATA%\vault-chat on Windows)
+rm -rf /path/to/vault-chat            # the tools, venv and launchers
 # your notes in ~/vault are untouched — delete them yourself if you want
 systemctl --user disable --now vault-index.timer lmstudio.service   # Linux
 ```

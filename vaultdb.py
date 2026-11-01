@@ -1,4 +1,4 @@
-"""Shared plumbing for the vault tools: config, SQLite storage, model calls.
+"""Shared plumbing for vault-chat: config, SQLite storage, model calls.
 
 Two backends are supported and auto-detected:
 
@@ -27,11 +27,21 @@ except ImportError:
     sys.exit("numpy is required:  python3 -m pip install --user numpy")
 
 
-def config_dir() -> Path:
-    """Where settings live, following each platform's convention."""
+def config_root() -> Path:
+    """The platform's per-user settings folder."""
     if sys.platform == "win32":
-        return Path(os.environ.get("APPDATA", "~")).expanduser() / "vault-tools"
-    return Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "vault-tools"
+        return Path(os.environ.get("APPDATA", "~")).expanduser()
+    return Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+
+
+def config_dir() -> Path:
+    """Where settings live, following each platform's convention.
+
+    The project used to be called vault-tools. Settings written under that
+    name keep working until the installer moves them, so renaming the project
+    never silently drops a configured model or vault path."""
+    new, old = config_root() / "vault-chat", config_root() / "vault-tools"
+    return old if old.is_dir() and not new.exists() else new
 
 
 CONFIG_PATH = config_dir() / "config.json"
@@ -102,6 +112,21 @@ CREATE TABLE IF NOT EXISTS reviews (
     last_review   REAL NOT NULL,
     interval_days REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT NOT NULL,
+    profile    TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_by_session ON messages(session_id);
 """
 
 
@@ -340,6 +365,73 @@ def load_matrix(conn: sqlite3.Connection) -> tuple[np.ndarray, list[sqlite3.Row]
     if not rows:
         return np.zeros((0, 0), dtype=np.float32), []
     return np.vstack([unpack(r["vec"]) for r in rows]), rows
+
+
+# ------------------------------------------------------------- sessions
+#
+# Conversation history lives in the same SQLite file as the index but in its
+# own tables, so `index.py --rebuild` never touches it. Only the plain
+# question and answer are stored — not the retrieved notes that were pasted
+# into the prompt — which keeps history small and keeps old note text from
+# being replayed to the model as if it were still current.
+
+
+def session_title(text: str) -> str:
+    """One short line, suitable for a list."""
+    line = " ".join(text.split())
+    return line[:60] + ("…" if len(line) > 60 else "") or "(untitled)"
+
+
+def create_session(conn: sqlite3.Connection, profile: str, title: str) -> int:
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO sessions(title, profile, created_at, updated_at) VALUES(?,?,?,?)",
+        (session_title(title), profile, now, now),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def add_messages(conn: sqlite3.Connection, session_id: int, pairs: list[tuple[str, str]]) -> None:
+    """Append (role, content) pairs in order and bump the session's clock."""
+    now = time.time()
+    conn.executemany(
+        "INSERT INTO messages(session_id, role, content, created_at) VALUES(?,?,?,?)",
+        [(session_id, role, content, now + i * 1e-6) for i, (role, content) in enumerate(pairs)],
+    )
+    conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
+    conn.commit()
+
+
+def session_messages(conn: sqlite3.Connection, session_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id", (session_id,)
+    ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def get_session(conn: sqlite3.Connection, session_id: int):
+    return conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+
+
+def list_sessions(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT s.id, s.title, s.profile, s.created_at, s.updated_at, "
+        "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS n "
+        "FROM sessions s ORDER BY s.updated_at DESC, s.id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def latest_session_id(conn: sqlite3.Connection) -> int | None:
+    row = conn.execute("SELECT id FROM sessions ORDER BY updated_at DESC, id DESC LIMIT 1").fetchone()
+    return int(row["id"]) if row else None
+
+
+def delete_session(conn: sqlite3.Connection, session_id: int) -> None:
+    conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
 
 
 # ----------------------------------------------------------------- misc

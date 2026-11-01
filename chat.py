@@ -21,6 +21,7 @@ import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import agent
 import ask
@@ -90,6 +91,16 @@ PAGE = r"""<!doctype html>
   textarea:focus { outline: none; border-color: #3a3a45; }
   .composer button { width: auto; padding: 11px 18px; }
   .hint { max-width: 780px; margin: 8px auto 0; font-size: 11px; color: var(--faint); }
+  .hist { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #sessions { flex: 1; min-height: 0; overflow-y: auto; margin: 0 -6px; }
+  .sess { display: flex; align-items: center; gap: 6px; padding: 6px; border-radius: 6px;
+          cursor: pointer; font-size: 12.5px; color: var(--dim); }
+  .sess:hover, .sess.on { background: #202024; }
+  .sess.on { color: var(--text); }
+  .sess .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess .x { width: auto; border: none; background: none; padding: 0 5px; color: var(--faint); }
+  .sess .x:hover { color: #f7768e; }
+  .none { font-size: 12px; color: var(--faint); padding: 6px; }
   .blink::after { content: "▍"; color: var(--accent); animation: b 1s steps(2) infinite; }
   @keyframes b { 0%,50% { opacity: 1 } 51%,100% { opacity: 0 } }
 </style>
@@ -103,6 +114,10 @@ PAGE = r"""<!doctype html>
     <div id="desc" style="margin-top:8px"></div>
   </div>
   <button id="reset">New conversation</button>
+  <div class="hist">
+    <label>History</label>
+    <div id="sessions"></div>
+  </div>
   <div id="meta"></div>
 </aside>
 <main>
@@ -122,6 +137,7 @@ const sendBtn = document.getElementById("send");
 const profileSel = document.getElementById("profile");
 const descEl = document.getElementById("desc");
 let history = [];
+let sessionId = null;
 let profiles = {};
 let controller = null;
 
@@ -173,8 +189,65 @@ function showDesc() {
 profileSel.onchange = showDesc;
 
 document.getElementById("reset").onclick = () => {
-  history = []; log.innerHTML = ""; input.focus();
+  if (controller) return;
+  history = []; sessionId = null; log.innerHTML = ""; input.focus();
+  loadSessions();
 };
+
+async function loadSessions() {
+  const box = document.getElementById("sessions");
+  try {
+    const list = await (await fetch("/api/sessions")).json();
+    box.innerHTML = "";
+    if (!list.length) {
+      const none = document.createElement("div");
+      none.className = "none"; none.textContent = "Nothing saved yet.";
+      box.appendChild(none);
+      return;
+    }
+    for (const s of list) {
+      const row = document.createElement("div");
+      row.className = "sess" + (s.id === sessionId ? " on" : "");
+      const t = document.createElement("span");
+      t.className = "t"; t.textContent = s.title; t.title = s.title;   // textContent: titles are untrusted
+      const x = document.createElement("button");
+      x.className = "x"; x.textContent = "\u00d7"; x.title = "Delete";
+      row.onclick = () => openSession(s.id);
+      x.onclick = ev => { ev.stopPropagation(); deleteSession(s.id); };
+      row.append(t, x);
+      box.appendChild(row);
+    }
+  } catch (e) { /* history is a convenience; never block chatting on it */ }
+}
+
+async function openSession(id) {
+  if (controller) return;              // not while a reply is streaming
+  const res = await fetch("/api/session?id=" + id);
+  if (!res.ok) return;
+  const s = await res.json();
+  sessionId = s.id;
+  history = s.messages;
+  log.innerHTML = "";
+  if (profiles[s.profile]) { profileSel.value = s.profile; showDesc(); }
+  for (const m of history) {
+    const user = m.role === "user";
+    const body = addTurn(user ? "you" : s.profile, user ? "user" : "bot");
+    if (user) body.textContent = m.content; else body.innerHTML = render(m.content);
+  }
+  log.scrollTop = log.scrollHeight;
+  loadSessions();
+  input.focus();
+}
+
+async function deleteSession(id) {
+  if (!confirm("Delete this conversation?")) return;
+  await fetch("/api/session/delete", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+  if (id === sessionId) { sessionId = null; history = []; log.innerHTML = ""; }
+  loadSessions();
+}
 
 input.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -215,7 +288,8 @@ async function send() {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ profile: profileSel.value, messages: history }),
+      body: JSON.stringify({ profile: profileSel.value, messages: history,
+                             save: true, session: sessionId }),
       signal: controller.signal,
     });
     const reader = res.body.getReader();
@@ -234,6 +308,7 @@ async function send() {
         else if (ev.type === "citations") { cites = ev.items; paint(); }
         else if (ev.type === "tool") { tools.push(ev.text); paint(); }
         else if (ev.type === "stats") { stats = ev.text; paint(); }
+        else if (ev.type === "session") { sessionId = ev.id; }
         else if (ev.type === "error") {
           body.innerHTML = '<span class="err">' + esc(ev.text) + "</span>";
         }
@@ -250,9 +325,11 @@ async function send() {
   else history.pop();
   paint();
   input.focus();
+  loadSessions();
 }
 
 loadMeta();
+loadSessions();
 </script>
 </body>
 </html>
@@ -287,23 +364,94 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes
 
+    def _json_body(self):
+        """Parse a JSON POST body, or send the error and return None.
+
+        Requiring application/json matters: a web page on another site can
+        send a "simple" cross-origin POST to localhost without any preflight,
+        but only with a form-ish content type. Insisting on JSON makes the
+        browser preflight it, which this server never approves."""
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            self._send(415, b"expected application/json", "text/plain")
+            return None
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            data = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError:
+            self._send(400, b"bad json", "text/plain")
+            return None
+        if not isinstance(data, dict):
+            self._send(400, b"expected an object", "text/plain")
+            return None
+        return data
+
+    def _json(self, code: int, obj) -> None:
+        self._send(code, json.dumps(obj).encode(), "application/json")
+
+    # -- routes
+
     def do_GET(self) -> None:
-        if self.path == "/":
+        parts = urlsplit(self.path)
+        route = parts.path
+        if route == "/":
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
-        elif self.path == "/api/meta":
-            self._send(200, json.dumps(self.meta()).encode(), "application/json")
+        elif route == "/api/meta":
+            self._json(200, self.meta())
+        elif route == "/api/sessions":
+            conn = v.connect()
+            try:
+                rows = v.list_sessions(conn, 60)
+            finally:
+                conn.close()
+            self._json(200, [
+                {"id": r["id"], "title": r["title"], "profile": r["profile"],
+                 "updated": r["updated_at"], "turns": r["n"] // 2}
+                for r in rows
+            ])
+        elif route == "/api/session":
+            try:
+                sid = int(parse_qs(parts.query).get("id", [""])[0])
+            except ValueError:
+                self._send(400, b"bad id", "text/plain")
+                return
+            conn = v.connect()
+            try:
+                row = v.get_session(conn, sid)
+                messages = v.session_messages(conn, sid) if row else []
+            finally:
+                conn.close()
+            if not row:
+                self._send(404, b"not found", "text/plain")
+                return
+            self._json(200, {"id": row["id"], "title": row["title"],
+                             "profile": row["profile"], "messages": messages})
         else:
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self) -> None:
-        if self.path != "/api/chat":
+        route = urlsplit(self.path).path
+        if route == "/api/session/delete":
+            payload = self._json_body()
+            if payload is None:
+                return
+            try:
+                sid = int(payload.get("id"))
+            except (TypeError, ValueError):
+                self._send(400, b"bad id", "text/plain")
+                return
+            conn = v.connect()
+            try:
+                v.delete_session(conn, sid)
+            finally:
+                conn.close()
+            self._json(200, {"ok": True})
+            return
+
+        if route != "/api/chat":
             self._send(404, b"not found", "text/plain")
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            payload = json.loads(self.rfile.read(length))
-        except json.JSONDecodeError:
-            self._send(400, b"bad json", "text/plain")
+        payload = self._json_body()
+        if payload is None:
             return
 
         self.send_response(200)
@@ -343,6 +491,37 @@ class Handler(BaseHTTPRequestHandler):
             },
         }
 
+    def open_session(self, raw_id, profile_name: str, question: str) -> tuple[int, bool]:
+        """The session this exchange belongs to, and whether we just made it.
+        An id that does not exist (deleted in another tab, say) starts afresh
+        rather than failing."""
+        conn = v.connect()
+        try:
+            try:
+                sid = int(raw_id) if raw_id is not None else None
+            except (TypeError, ValueError):
+                sid = None
+            if sid is not None and v.get_session(conn, sid) is not None:
+                return sid, False
+            return v.create_session(conn, profile_name, question), True
+        finally:
+            conn.close()
+
+    def close_session(self, sid, created: bool, question: str, answer: str) -> None:
+        """Runs even when the browser hit Stop, so a partial answer is kept —
+        the page keeps it in view, and the two should not disagree. A session
+        we created that produced nothing is removed rather than left empty."""
+        if sid is None:
+            return
+        conn = v.connect()
+        try:
+            if answer.strip():
+                v.add_messages(conn, sid, [("user", question), ("assistant", answer.strip())])
+            elif created:
+                v.delete_session(conn, sid)
+        finally:
+            conn.close()
+
     def stream_reply(self, payload: dict) -> None:
         profiles = agent.load_profiles()
         name = payload.get("profile") or self.server.profile  # type: ignore[attr-defined]
@@ -357,68 +536,89 @@ class Handler(BaseHTTPRequestHandler):
             return
         question = messages[-1]["content"]
 
-        # Ground the newest question in the vault, exactly as the CLI does.
-        prompt = question
-        if profile.get("vault"):
-            conn = v.connect()
-            try:
-                hits = ask.retrieve(
-                    conn, question,
-                    self.server.k,          # type: ignore[attr-defined]
-                    self.server.min_score,  # type: ignore[attr-defined]
-                )
-            finally:
-                conn.close()
-            if hits:
-                context, included = ask.build_context(
-                    hits, self.server.max_context_chars  # type: ignore[attr-defined]
-                )
-                prompt = f"Notes:\n\n{context}\n\nQuestion: {question}"
-                self._event({
-                    "type": "citations",
-                    "items": [
-                        {
-                            "n": n,
-                            "where": row["path"] + (f" › {row['heading']}" if row["heading"] else ""),
-                            "score": f"{score:.2f}",
-                        }
-                        for n, (score, row) in enumerate(included, start=1)
-                    ],
-                })
+        # Saving is opt-in per request, so scripted callers stay stateless.
+        sid, created = (None, False)
+        if payload.get("save"):
+            sid, created = self.open_session(payload.get("session"), name, question)
 
-        integrations = profile.get("integrations") or []
-        temperature = profile.get("temperature", 0.2)
+        answer_parts: list[str] = []
+
+        def token(text: str) -> None:
+            answer_parts.append(text)
+            self._event({"type": "token", "text": text})
 
         try:
-            if integrations:
-                agent.check_allowlists(profile, False)
-                data = v.agent_chat(
-                    prompt,
-                    integrations=integrations,
-                    system=profile.get("system"),
-                    temperature=temperature,
-                )
-                for item in data.get("output") or []:
-                    if item.get("type") == "tool_call":
-                        self._event({"type": "tool", "text": f"called {item.get('tool')}"})
-                self._event({"type": "token", "text": agent.render(data, False)})
-                stats = data.get("stats") or {}
-                if stats.get("tokens_per_second"):
+            if sid is not None:
+                self._event({"type": "session", "id": sid})
+
+            # Ground the newest question in the vault, exactly as the CLI does.
+            prompt = question
+            if profile.get("vault"):
+                conn = v.connect()
+                try:
+                    hits = ask.retrieve(
+                        conn, question,
+                        self.server.k,          # type: ignore[attr-defined]
+                        self.server.min_score,  # type: ignore[attr-defined]
+                    )
+                finally:
+                    conn.close()
+                if hits:
+                    context, included = ask.build_context(
+                        hits, self.server.max_context_chars  # type: ignore[attr-defined]
+                    )
+                    prompt = f"Notes:\n\n{context}\n\nQuestion: {question}"
                     self._event({
-                        "type": "stats",
-                        "text": f"{stats['tokens_per_second']:.1f} tok/s · "
-                                f"{stats.get('time_to_first_token_seconds', 0):.1f}s to first token",
+                        "type": "citations",
+                        "items": [
+                            {
+                                "n": n,
+                                "where": row["path"] + (f" › {row['heading']}" if row["heading"] else ""),
+                                "score": f"{score:.2f}",
+                            }
+                            for n, (score, row) in enumerate(included, start=1)
+                        ],
                     })
-            else:
-                convo = [{"role": "system", "content": profile.get("system", "")}]
-                convo += messages[:-1]
-                convo.append({"role": "user", "content": prompt})
-                for piece in v.chat_stream(convo, temperature=temperature):
-                    self._event({"type": "token", "text": piece})
-        except SystemExit as exc:
+
+            integrations = profile.get("integrations") or []
+            temperature = profile.get("temperature", 0.2)
+
+            try:
+                if integrations:
+                    agent.check_allowlists(profile, False)
+                    data = v.agent_chat(
+                        prompt,
+                        integrations=integrations,
+                        system=profile.get("system"),
+                        temperature=temperature,
+                    )
+                    for item in data.get("output") or []:
+                        if item.get("type") == "tool_call":
+                            self._event({"type": "tool", "text": f"called {item.get('tool')}"})
+                    token(agent.render(data, False))
+                    stats = data.get("stats") or {}
+                    if stats.get("tokens_per_second"):
+                        self._event({
+                            "type": "stats",
+                            "text": f"{stats['tokens_per_second']:.1f} tok/s · "
+                                    f"{stats.get('time_to_first_token_seconds', 0):.1f}s to first token",
+                        })
+                else:
+                    # Earlier turns, trimmed to a budget: the browser sends the
+                    # whole conversation, but a small model cannot afford it.
+                    convo = [{"role": "system", "content": profile.get("system", "")}]
+                    convo += agent.trim_history(messages[:-1], agent.HISTORY_CHARS)
+                    convo.append({"role": "user", "content": prompt})
+                    for piece in v.chat_stream(convo, temperature=temperature):
+                        token(piece)
+            except SystemExit as exc:
+                self._event({"type": "error", "text": str(exc)})
+            except Exception as exc:  # a dead runtime should not kill the server
+                self._event({"type": "error", "text": f"{type(exc).__name__}: {exc}"})
+        except SystemExit as exc:  # e.g. "Index is empty" during retrieval
             self._event({"type": "error", "text": str(exc)})
-        except Exception as exc:  # a dead runtime should not kill the server
-            self._event({"type": "error", "text": f"{type(exc).__name__}: {exc}"})
+        finally:
+            self.close_session(sid, created, question, "".join(answer_parts))
 
         self._event({"type": "done"})
 

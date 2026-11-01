@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set up the vault tools on Linux, macOS or Windows.
+"""Set up vault-chat on Linux, macOS or Windows.
 
 Everything it does is reversible and nothing is installed system-wide: a
 private virtual environment, a config file, a notes folder, and launcher
@@ -64,10 +64,28 @@ def venv_python() -> Path:
     return VENV / ("Scripts/python.exe" if IS_WIN else "bin/python")
 
 
-def config_dir() -> Path:
+def config_root() -> Path:
     if IS_WIN:
-        return Path(os.environ.get("APPDATA", "~")).expanduser() / "vault-tools"
-    return Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "vault-tools"
+        return Path(os.environ.get("APPDATA", "~")).expanduser()
+    return Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+
+
+def config_dir() -> Path:
+    # Must agree with vaultdb.config_dir(), which the tools read at runtime.
+    new, old = config_root() / "vault-chat", config_root() / "vault-tools"
+    return old if old.is_dir() and not new.exists() else new
+
+
+def migrate_legacy_config() -> None:
+    """The project used to be called vault-tools. Move its settings across
+    once, so config.json and profiles.json carry over untouched."""
+    new, old = config_root() / "vault-chat", config_root() / "vault-tools"
+    if old.is_dir() and not new.exists():
+        try:
+            old.rename(new)
+            say(OK, f"moved settings from {old.name}/ to {new.name}/")
+        except OSError as exc:
+            say(WARN, f"could not move {old} to {new} ({exc}); still using the old folder")
 
 
 def probe(url: str) -> bool:
@@ -276,12 +294,13 @@ def _schedule_systemd() -> None:
     for unit in ("vault-index.service", "vault-index.timer"):
         shutil.copy(HERE / "systemd" / unit, units / unit)
     # The shipped unit points at index.py directly; use the venv launcher so
-    # numpy resolves without a system-wide install.
+    # numpy resolves without a system-wide install. Either folder name is
+    # accepted, since the project was renamed from vault-tools.
     service = units / "vault-index.service"
-    service.write_text(
-        service.read_text().replace("%h/vault-tools/index.py", f"{BIN / 'vault-index'}"),
-        encoding="utf-8",
-    )
+    text = service.read_text()
+    for shipped in ("%h/vault-chat/index.py", "%h/vault-tools/index.py"):
+        text = text.replace(shipped, f"{BIN / 'vault-index'}")
+    service.write_text(text, encoding="utf-8")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "--user", "enable", "--now", "vault-index.timer"], check=True)
     say(OK, "systemd timer enabled (03:00 nightly)")
@@ -401,8 +420,9 @@ def main() -> int:
     if args.check:
         return do_check(vault)
 
-    print(f"\nInstalling vault tools from {HERE}\n")
+    print(f"\nInstalling vault-chat from {HERE}\n")
     step_python()
+    migrate_legacy_config()
     step_venv(args.yes)
     step_vault(vault, args.yes)
     info = step_hardware(args.quick)
